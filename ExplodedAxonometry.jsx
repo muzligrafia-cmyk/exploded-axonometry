@@ -7,9 +7,9 @@
   - Every selected path, compound path or group = ONE layer (groups are never broken up).
   - Layer order comes from the real stacking order (back -> front).
   - The result is a new group "Exploded view" next to the original; the original is untouched.
-  - Strokes are NOT scaled: path points are moved directly. Colours stay the same.
+  - Each layer is tilted as one whole object (holes included); stroke widths are
+    written back afterwards, so they never change. Colours stay the same.
   - Gradient angles follow the tilt.
-  - Compound paths that scripts can't look inside are released, tilted and re-made.
 
   HOW IT STAYS SAFE
   Illustrator remembers objects by their position ("5th item on this layer"), so adding
@@ -581,174 +581,125 @@
                 try { origByK[order[i]].note = savedNotes[order[i]]; } catch (eR) {}
             }
 
-            // ---- Tilt the copies (only point edits from here on, no structure changes) ----
-            var unsupported = 0, gradFail = 0, lockFail = 0, failed = [];
-            var marks = [];
-            function flagObj(obj, tag) {
-                marks.push({ obj: obj, note: getNote(obj) });
-                obj.note = tag;
-            }
-            function readGradient(color) {
-                if (!color || color.typename !== "GradientColor") return null;
-                return { o: [color.origin[0], color.origin[1]], a: color.angle, l: color.length };
-            }
-            function applyGradient(color, g, idx) {
-                var rad = g.a * Math.PI / 180;
-                var endPt = [g.o[0] + g.l * Math.cos(rad), g.o[1] + g.l * Math.sin(rad)];
-                var o2 = P(g.o, idx), e2 = P(endPt, idx);
-                var dx = e2[0] - o2[0], dy = e2[1] - o2[1];
-                color.origin = o2;
-                color.angle = Math.atan2(dy, dx) * 180 / Math.PI;
-                color.length = Math.sqrt(dx * dx + dy * dy);
-            }
-            function projectPath(p, idx) {
-                if (getNote(p) === TAG_DONE) return;           // never move a path twice
+            // ---- Tilt the copies ----
+            // Each copy is tilted as ONE object with Illustrator's own transform, so every
+            // part inside it moves - including compound-path holes that Illustrator hides
+            // from scripts (those were left behind before, sitting on top of the original).
+            // Gradients get the same tilt. Stroke widths are written back afterwards,
+            // so they never change.
+            var unsupported = 0, gradFail = 0, lockFail = 0, noRelease = 0, remakeFail = 0, failed = [];
+            var widthUnchecked = 0;
 
-                var doGradient = true;                          // compound paths share one gradient
-                try {
-                    if (p.parent.typename === "CompoundPathItem") {
-                        if (getNote(p.parent) === TAG_GRAD) doGradient = false;
-                        else flagObj(p.parent, TAG_GRAD);
-                    }
-                } catch (eP) {}
-
-                var fg = null, sg = null;
-                if (doGradient) {
-                    try { if (p.filled) fg = readGradient(p.fillColor); } catch (e3) { gradFail++; }
-                    try { if (p.stroked) sg = readGradient(p.strokeColor); } catch (e4) { gradFail++; }
-                }
-
-                var pts = p.pathPoints, cnt = pts.length, data = [], j;
-                for (j = 0; j < cnt; j++) {
-                    data.push([pts[j].anchor, pts[j].leftDirection, pts[j].rightDirection]);
-                }
-                for (j = 0; j < cnt; j++) {
-                    var pp = pts[j];
-                    pp.anchor = P(data[j][0], idx);
-                    pp.leftDirection = P(data[j][1], idx);
-                    pp.rightDirection = P(data[j][2], idx);
-                }
-
-                if (fg) { try { var fc = p.fillColor; applyGradient(fc, fg, idx); p.fillColor = fc; } catch (e5) { gradFail++; } }
-                if (sg) { try { var sc = p.strokeColor; applyGradient(sc, sg, idx); p.strokeColor = sc; } catch (e6) { gradFail++; } }
-
-                flagObj(p, TAG_DONE);
-            }
-            function projectItem(it, idx) {
-                try { if (it.locked) it.locked = false; } catch (eL) { lockFail++; }
-                var tn = it.typename, m;
-                if (tn === "PathItem") {
-                    projectPath(it, idx);
-                } else if (tn === "CompoundPathItem") {
-                    for (m = 0; m < it.pathItems.length; m++) projectPath(it.pathItems[m], idx);
-                } else if (tn === "GroupItem") {
-                    for (m = 0; m < it.pageItems.length; m++) projectItem(it.pageItems[m], idx);
-                } else {
-                    unsupported++;
-                }
-            }
-
-            // ---- Tag every copy so it can always be found again ----
+            // Tag every copy so it can always be found again
             // (on the temp layer, item [0] is the front copy and [n-1] the back copy)
             for (i = 0; i < n; i++) {
                 copyNotes[i] = savedNotes[order[i]];
                 tmp.pageItems[n - 1 - i].note = TAG_COPY + i + "__";
             }
-
-            // ---- Compound paths that scripts can't look inside ----
-            // Illustrator reports some compound paths as having 0 paths. Those are
-            // released into a temporary group, tilted like any group, and re-made afterwards.
-            var noRelease = 0, remakeFail = 0;
-            function findBroken(container) {
-                var its = container.pageItems, len = its.length, j;
-                for (j = 0; j < len; j++) {
-                    var it = its[j];
-                    if (it.typename === "CompoundPathItem") {
-                        var cntP = 0;
-                        try { cntP = it.pathItems.length; } catch (eB) {}
-                        if (cntP === 0 && it.name !== SKIP_NAME) return it;
-                    } else if (it.typename === "GroupItem") {
-                        var r = findBroken(it);
-                        if (r) return r;
-                    }
-                }
-                return null;
-            }
-            var guard = 0, bc;
-            while ((bc = findBroken(tmp)) !== null && guard < 500) {
-                guard++;
-                var keepNote = getNote(bc);
-                try { if (bc.locked) bc.locked = false; } catch (eU) {}
-                try { if (bc.hidden) bc.hidden = false; } catch (eH) {}
-                doc.selection = null;
-                bc.selected = true;
-                app.executeMenuCommand("noCompoundPath");          // Object > Compound Path > Release
-                var rs = doc.selection;
-                if (!rs || rs.length === 0 || (rs.length === 1 && rs[0].typename === "CompoundPathItem")) {
-                    // could not be released: mark it so it is not tried again
-                    var still = findBroken(tmp);
-                    if (still) { try { still.name = SKIP_NAME; } catch (eS1) {} }
-                    noRelease++;
-                    continue;
-                }
-                app.executeMenuCommand("group");                    // keep the pieces together
-                var hg = doc.selection[0];
-                hg.name = REMAKE_NAME;
-                hg.note = keepNote;                                 // keeps the copy tag if it had one
-            }
-            doc.selection = null;
-
-            // ---- Find the copies again (fresh references, no structure changes after this) ----
             var copyByIdx = [];
             for (i = 0; i < tmp.pageItems.length; i++) {
                 var ci = copyIndex(getNote(tmp.pageItems[i]));
                 if (ci >= 0) copyByIdx[ci] = tmp.pageItems[i];
             }
 
-            // ---- Tilt ----
+            // The tilt itself (the same for every layer): x' = A*x + C*y,  y' = B*x + D*y
+            var LA = uAxis[0], LB = uAxis[1], LC = vAxis[0], LD = vAxis[1];
+            function lin(p) { return [LA * p[0] + LC * p[1], LB * p[0] + LD * p[1]]; }
+            function near(a, b) { return Math.abs(a[0] - b[0]) < 0.05 && Math.abs(a[1] - b[1]) < 0.05; }
+            function makeMatrix(v) {
+                var m = app.getIdentityMatrix();
+                m.mValueA = v[0]; m.mValueB = v[1]; m.mValueC = v[2]; m.mValueD = v[3];
+                m.mValueTX = 0; m.mValueTY = 0;
+                return m;
+            }
+            function applyT(item, m) {
+                // positions, fill patterns, gradients, stroke patterns; widths fixed afterwards
+                item.transform(m, true, true, true, true, 100, Transformation.DOCUMENTORIGIN);
+            }
+            function readPts(pth) {
+                var r = [], q;
+                for (q = 0; q < pth.pathPoints.length; q++) r.push(pth.pathPoints[q].anchor);
+                return r;
+            }
+
+            // ---- Calibrate on a tiny invisible test triangle ----
+            // Illustrator's matrix and origin conventions differ between setups, so the
+            // script checks which version moves the test points exactly where they belong.
+            var CAND = [[LA, LB, LC, LD], [LA, LC, LB, LD], [LA, -LB, -LC, LD], [LA, -LC, -LB, LD]];
+            var probePts = [[cx, cy], [cx + 100, cy], [cx, cy + 60]];
+            var goodM = null, shift = null, sgnX = 1, sgnY = 1;
+            for (k = 0; k < CAND.length && goodM === null; k++) {
+                var probe = tmp.pathItems.add();
+                probe.setEntirePath(probePts);
+                probe.closed = true; probe.filled = false; probe.stroked = false;
+                var mk = makeMatrix(CAND[k]);
+                applyT(probe, mk);
+                var got = readPts(probe);
+                var g1 = [got[1][0] - got[0][0], got[1][1] - got[0][1]];
+                var g2 = [got[2][0] - got[0][0], got[2][1] - got[0][1]];
+                if (near(g1, lin([100, 0])) && near(g2, lin([0, 60]))) {
+                    goodM = mk;
+                    var exp0 = lin(probePts[0]);
+                    shift = [got[0][0] - exp0[0], got[0][1] - exp0[1]];   // offset from Illustrator's origin
+                    probe.translate(10, 10);                               // which way does "translate" go?
+                    var moved = readPts(probe);
+                    if (moved[0][0] < got[0][0]) sgnX = -1;
+                    if (moved[0][1] < got[0][1]) sgnY = -1;
+                }
+                probe.remove();
+            }
+            if (goodM === null) {
+                tmp.remove(); tmp = null;
+                alert(SCRIPT_NAME + ": couldn't work out how this Illustrator version tilts objects.\n\n" +
+                      "Nothing was changed. Please send me this message.");
+                return;
+            }
+
+            // ---- Tilt every copy ----
+            function collectPaths(it, out) {
+                var t = it.typename, q;
+                try { if (it.locked) it.locked = false; } catch (eL) { lockFail++; }
+                if (t === "PathItem") {
+                    out.push(it);
+                } else if (t === "CompoundPathItem") {
+                    var cnt = 0;
+                    try { cnt = it.pathItems.length; } catch (eC) {}
+                    if (cnt === 0) widthUnchecked++;
+                    for (q = 0; q < cnt; q++) out.push(it.pathItems[q]);
+                } else if (t === "GroupItem") {
+                    for (q = 0; q < it.pageItems.length; q++) collectPaths(it.pageItems[q], out);
+                }
+            }
             for (i = 0; i < n; i++) {
-                if (!copyByIdx[i]) { failed.push("layer " + (i + 1) + " of " + n + ": copy not found"); continue; }
+                var copy = copyByIdx[i];
+                if (!copy) { failed.push("layer " + (i + 1) + " of " + n + ": copy not found"); continue; }
                 try {
-                    projectItem(copyByIdx[i], i);
+                    var paths = [], widths = [], q2;
+                    collectPaths(copy, paths);
+                    for (q2 = 0; q2 < paths.length; q2++) {
+                        var wv = null;
+                        try { if (paths[q2].stroked) wv = paths[q2].strokeWidth; } catch (eW) {}
+                        widths.push(wv);
+                    }
+
+                    applyT(copy, goodM);
+
+                    // move it to its place in the exploded stack
+                    var kx = cx - (LA * cx + LC * cy) + i * gap * dir[0] + sx;
+                    var ky = cy - (LB * cx + LD * cy) + i * gap * dir[1] + sy;
+                    copy.translate(sgnX * (kx - shift[0]), sgnY * (ky - shift[1]));
+
+                    // stroke widths back to exactly what they were
+                    for (q2 = 0; q2 < paths.length; q2++) {
+                        if (widths[q2] === null) continue;
+                        try {
+                            if (Math.abs(paths[q2].strokeWidth - widths[q2]) > 0.0001) paths[q2].strokeWidth = widths[q2];
+                        } catch (eS) {}
+                    }
                 } catch (eI) {
                     failed.push("layer " + (i + 1) + " of " + n + ": " + eI.message + " (line " + eI.line + ")");
                 }
             }
-            for (k = marks.length - 1; k >= 0; k--) {
-                try { marks[k].obj.note = marks[k].note; } catch (eM) {}
-            }
-
-            // ---- Re-make the released compound paths ----
-            function findRemake(container) {
-                var its = container.pageItems, len = its.length, j;
-                for (j = 0; j < len; j++) {
-                    var it = its[j];
-                    if (it.typename === "GroupItem") {
-                        if (it.name === REMAKE_NAME) return it;
-                        var r = findRemake(it);
-                        if (r) return r;
-                    }
-                }
-                return null;
-            }
-            guard = 0;
-            var rg;
-            while ((rg = findRemake(tmp)) !== null && guard < 500) {
-                guard++;
-                var rgNote = getNote(rg);
-                doc.selection = null;
-                rg.selected = true;
-                app.executeMenuCommand("compoundPath");            // Object > Compound Path > Make
-                var ms = doc.selection;
-                if (ms && ms.length === 1 && ms[0].typename === "CompoundPathItem") {
-                    try { ms[0].note = rgNote; } catch (eRN) {}
-                } else {
-                    var left = findRemake(tmp);                     // stays a (tilted) group instead
-                    if (left) { try { left.name = ""; } catch (eRL) {} }
-                    remakeFail++;
-                }
-            }
-            doc.selection = null;
 
             // ---- Copies get their normal Notes back ----
             for (i = 0; i < tmp.pageItems.length; i++) {
@@ -777,6 +728,7 @@
             if (unsupported > 0) notes.push(unsupported + " object(s) inside groups (text, image, ...) could not be tilted and stayed flat.");
             if (gradFail > 0) notes.push(gradFail + " gradient(s) could not be adjusted.");
             if (lockFail > 0) notes.push(lockFail + " locked item(s) could not be unlocked.");
+            if (widthUnchecked > 0) notes.push(widthUnchecked + " compound path(s) hide their parts from scripts: they are tilted correctly, but please check their stroke width.");
             if (noRelease > 0) notes.push(noRelease + " compound path(s) could not be opened up and stayed flat.");
             if (remakeFail > 0) notes.push(remakeFail + " compound path(s) were tilted but are now plain groups (they could not be re-made as compound paths).");
             if (failed.length > 0) notes.push("Problems:\n  " + failed.join("\n  "));
