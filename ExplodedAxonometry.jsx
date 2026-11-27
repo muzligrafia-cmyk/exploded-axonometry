@@ -1,6 +1,6 @@
 #target illustrator
 /*
-  ExplodedAxonometry.jsx  (v3)
+  ExplodedAxonometry.jsx  (v4)
   Makes an "exploded" axonometric view of the selected artwork, showing how the
   design is built up from layers.
 
@@ -9,7 +9,12 @@
   - The result is a new group "Exploded view" next to the original; the original is untouched.
   - Each layer is tilted as one whole object (holes included); stroke widths are
     written back afterwards, so they never change. Colours stay the same.
-  - Gradient angles follow the tilt.
+  - Gradient angles follow the tilt. Tilt 0 keeps the layers exactly as they are.
+  - The two Slope planes and Floor give the Exploded layout; Flat means no tilt and
+    gives the Row layout.
+  - Two layouts: "Exploded" (spread out by a percentage) or "Row" (lined up in a
+    direction with a gap or overlap in mm, measured from the whole artwork or from
+    each layer like the Align panel's Distribute Spacing).
 
   HOW IT STAYS SAFE
   Illustrator remembers objects by their position ("5th item on this layer"), so adding
@@ -29,13 +34,19 @@
     // ------------------------------------------------------------------
     var SCRIPT_NAME   = "Exploded Axonometry";
     var MARGIN_FACTOR = 0.15;       // space between original and result (x artwork width)
+    var PT_PER_MM     = 72 / 25.4;
 
     var DEFAULTS = {
         tilt: 30,          // degrees
-        plane: 1,          // 0 slope down-right, 1 slope up-right, 2 flat
+        plane: 1,          // 0 slope down-right, 1 slope up-right, 3 floor (all: Exploded), 2 flat (no tilt: Row)
         spreadMode: 0,     // 0 natural, 1 natural reversed, 2 custom angle
         customAngle: 45,   // degrees, 0 = right, 90 = up
         gapPct: 10,        // % of the artwork's larger side
+        layout: 0,         // 0 exploded, 1 row - follows the sheet plane (slopes: exploded, flat: row)
+        rowDir: 0,         // 0 right, 1 left, 2 down, 3 up, 4 custom angle
+        rowAngle: 0,       // degrees, 0 = right, 90 = up
+        rowGapMm: 5,       // edge-to-edge spacing in the row; negative = overlap
+        rowMeasure: 0,     // 0 whole artwork (same-size slots), 1 each layer (Align-style)
         reverse: false
     };
 
@@ -116,11 +127,25 @@
     // Maths coordinates: x to the right, y UP.
     // ------------------------------------------------------------------
     function planeAxes(plane, tiltDeg) {
-        var th = clamp(tiltDeg, 5, 80) * Math.PI / 180;
+        var t = clamp(tiltDeg, 0, 80);
+        if (plane === 2) t = 0;              // Flat = no tilt, layers stay as they are
+        if (t < 0.001) {
+            // no tilt: layers stay as they are; "natural" spreads towards bottom-right
+            return { u: [1, 0], v: [0, 1], n: [Math.SQRT1_2, -Math.SQRT1_2] };
+        }
+        var th = t * Math.PI / 180;
         var c = Math.cos(th), sn = Math.sin(th);
         if (plane === 0) return { u: [c, -sn], v: [0, 1], n: [-c, -sn] };   // slope down-right
-        if (plane === 1) return { u: [c, sn], v: [0, 1], n: [c, -sn] };     // slope up-right
-        return { u: [c, sn], v: [-c, sn], n: [0, 1] };                      // flat
+        if (plane === 3) return { u: [c, sn], v: [-c, sn], n: [0, 1] };     // floor (lying down)
+        return { u: [c, sn], v: [0, 1], n: [c, -sn] };                      // slope up-right
+    }
+    function rowVector(dirIdx, customDeg) {     // unit vector for the row layout, y up
+        if (dirIdx === 0) return [1, 0];
+        if (dirIdx === 1) return [-1, 0];
+        if (dirIdx === 2) return [0, -1];
+        if (dirIdx === 3) return [0, 1];
+        var ca = customDeg * Math.PI / 180;
+        return [Math.cos(ca), Math.sin(ca)];
     }
     function spreadDir(ax, mode, customDeg) {
         if (mode === 0) return [ax.n[0], ax.n[1]];
@@ -145,6 +170,7 @@
     var C_SHEET    = [0.85, 0.85, 0.85, 1];
     var C_FRONT    = [1.00, 0.72, 0.45, 1];
     var C_LETTER   = [0.20, 0.20, 0.20, 1];
+    var C_SLOT     = [0.36, 0.36, 0.36, 1];
 
     // one sheet as 4 corners (maths coords), centred on (ox, oy)
     function sheetPts(ax, ox, oy) {
@@ -179,9 +205,13 @@
 
     // shapes: [{ pts: [[x,y],...], fill: colour, lines: [[[x,y],...],...], lineW: n }, ...]
     // drawn back to front; "lines" (optional) are open strokes drawn on top of that shape
-    function drawTile(btn, shapes, label, on, font) {
+    function drawTile(btn, shapes, label, on, font, dim) {
         var g = btn.graphics;
         var w = btn.size[0], h = btn.size[1], i, j;
+        function F(c) {                       // fade a colour into the tile when unavailable
+            if (!dim) return c;
+            return [c[0] * 0.3 + C_TILE[0] * 0.7, c[1] * 0.3 + C_TILE[1] * 0.7, c[2] * 0.3 + C_TILE[2] * 0.7, 1];
+        }
 
         var bgCol = C_TILE;
         if (on) bgCol = C_TILE_ON;
@@ -193,7 +223,7 @@
         if (on) { edgeCol = C_ACCENT; edgeW = 3; }
         g.newPath();
         g.rectPath(1, 1, w - 2, h - 2);
-        g.strokePath(g.newPen(g.PenType.SOLID_COLOR, edgeCol, edgeW));
+        g.strokePath(g.newPen(g.PenType.SOLID_COLOR, F(edgeCol), edgeW));
 
         // fit all shapes into the icon area
         var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -211,7 +241,7 @@
         var sc = Math.min(bw / spanX, bh / spanY);
         var offX = bx + (bw - spanX * sc) / 2, offY = by + (bh - spanY * sc) / 2;
 
-        var linePen = g.newPen(g.PenType.SOLID_COLOR, C_LINE, 1);
+        var linePen = g.newPen(g.PenType.SOLID_COLOR, F(C_LINE), 1);
         for (i = 0; i < shapes.length; i++) {
             var pts = shapes[i].pts;
             g.newPath();
@@ -222,13 +252,13 @@
                 else g.lineTo(sx, sy);
             }
             g.closePath();
-            g.fillPath(g.newBrush(g.BrushType.SOLID_COLOR, shapes[i].fill));
+            g.fillPath(g.newBrush(g.BrushType.SOLID_COLOR, F(shapes[i].fill)));
             g.strokePath(linePen);
 
             if (shapes[i].lines) {
                 var lw = shapes[i].lineW;
                 if (!lw) lw = 3;
-                var letterPen = g.newPen(g.PenType.SOLID_COLOR, C_LETTER, lw);
+                var letterPen = g.newPen(g.PenType.SOLID_COLOR, F(C_LETTER), lw);
                 for (var m = 0; m < shapes[i].lines.length; m++) {
                     var ln = shapes[i].lines[m];
                     g.newPath();
@@ -244,7 +274,7 @@
         }
 
         // label
-        var textPen = g.newPen(g.PenType.SOLID_COLOR, C_TEXT, 1);
+        var textPen = g.newPen(g.PenType.SOLID_COLOR, F(C_TEXT), 1);
         var tw = 0;
         try { tw = g.measureString(label, font)[0]; } catch (eM) { tw = label.length * 7; }
         g.drawString(label, textPen, Math.max(4, (w - tw) / 2), h - LABEL_H - 2, font);
@@ -265,8 +295,12 @@
         var FONT = makeFont("REGULAR", 14), TILE_FONT = makeFont("REGULAR", 14);
         var DEG = "\u00B0";
 
-        var plane = clamp(Math.round(s.plane), 0, 2);
+        var plane = clamp(Math.round(s.plane), 0, 3);
         var mode = clamp(Math.round(s.spreadMode), 0, 2);
+        var layout = (plane === 2) ? 1 : 0;   // slopes: Exploded, flat: Row
+        var slopeTilt = String(s.tilt);       // remembered while Flat shows 0
+        var rowDir = clamp(Math.round(s.rowDir), 0, 4);
+        var rowMeasure = clamp(Math.round(s.rowMeasure), 0, 1);
 
         var w = new Window("dialog", SCRIPT_NAME);
         w.orientation = "column";
@@ -285,8 +319,8 @@
             setFont(e, FONT);
             return e;
         }
-        function panel(title) {
-            var p = w.add("panel", undefined, title);
+        function panel(parent, title) {
+            var p = parent.add("panel", undefined, title);
             p.orientation = "column";
             p.alignChildren = "left";
             p.margins = [14, 22, 14, 14];
@@ -303,69 +337,115 @@
         function repaint(list) {
             for (var i = 0; i < list.length; i++) { list[i].hide(); list[i].show(); }   // hide + show = repaint
         }
+        function addTile(row, idx, tw, tip, drawFn, clickFn) {
+            var b = row.add("button", undefined, "");
+            b.preferredSize = [tw, TILE_H];
+            b.axoIndex = idx;
+            b.helpTip = tip;
+            b.onDraw = function () { try { drawFn(this); } catch (eD) {} };
+            b.onClick = function () { clickFn(this.axoIndex); };
+            return b;
+        }
+        function curTilt() {
+            if (plane === 2) return 0;
+            return clamp(num(tiltE.text, DEFAULTS.tilt), 0, 80);
+        }
+        function layoutFor(pl) { if (pl === 2) return 1; return 0; }   // slopes: Exploded, flat: Row
+
+        // three sheets in a row along unit direction d, spacing as typed (pictogram only)
+        function rowShapes(ax, d, spacingMm) {
+            var base = sheetPts(ax, 0, 0), lo = Infinity, hi = -Infinity, k;
+            for (k = 0; k < 4; k++) {
+                var dp = base[k][0] * d[0] + base[k][1] * d[1];
+                if (dp < lo) lo = dp;
+                if (dp > hi) hi = dp;
+            }
+            var len = hi - lo;
+            var step = len + len * clamp(spacingMm / 50, -0.6, 0.4);
+            var fills = [C_BACK, C_MID, C_FRONT], shapes = [];
+            for (k = 0; k < 3; k++) {
+                var sh = { pts: sheetPts(ax, k * step * d[0], k * step * d[1]), fill: fills[k] };
+                if (k === 2) { sh.lines = letterLines(ax, k * step * d[0], k * step * d[1]); sh.lineW = 2; }
+                shapes.push(sh);
+            }
+            return shapes;
+        }
+        // three sheets spread like the exploded view (pictogram only)
+        function explodedShapes(ax, d) {
+            var fills = [C_BACK, C_MID, C_FRONT], shapes = [], k;
+            for (k = 0; k < 3; k++) {
+                var sh = { pts: sheetPts(ax, k * 1.1 * d[0], k * 1.1 * d[1]), fill: fills[k] };
+                if (k === 2) { sh.lines = letterLines(ax, k * 1.1 * d[0], k * 1.1 * d[1]); sh.lineW = 2; }
+                shapes.push(sh);
+            }
+            return shapes;
+        }
+        function rectPts(x0, y0, x1, y1) { return [[x0, y1], [x1, y1], [x1, y0], [x0, y0]]; }
+        // big sheet, small piece in the middle, small piece top-right
+        var PIECES = [[0, 0, 3, 2], [1.1, 0.6, 1.9, 1.4], [2.0, 1.2, 2.8, 1.8]];
+        function measureShapes(idx) {
+            var fills = [C_BACK, C_MID, C_FRONT], shapes = [], k, off = 0;
+            for (k = 0; k < 3; k++) {
+                var pc = PIECES[k];
+                if (idx === 0) {
+                    off = k * 3.4;                                       // same-size slots
+                    shapes.push({ pts: rectPts(off, 0, off + 3, 2), fill: C_SLOT });
+                } else if (k > 0) {
+                    var prev = PIECES[k - 1];
+                    off = off + (prev[2] + 0.25) - pc[0];                // packed edge to edge
+                }
+                shapes.push({ pts: rectPts(pc[0] + off, pc[1], pc[2] + off, pc[3]), fill: fills[k] });
+            }
+            return shapes;
+        }
+        function repaintAll() { repaint(planeTiles); repaint(dirTiles); repaint(rowTiles); }
 
         // ---- Projection ----
-        var pp = panel("Projection");
+        var pp = panel(w, "Projection");
         var r1 = pp.add("group");
         label(r1, "Tilt angle (X" + DEG + "):");
         var tiltE = numberField(r1, s.tilt);
-        tiltE.helpTip = "30 = classic isometric look";
+        tiltE.helpTip = "0 = no tilt, layers stay as they are. 30 = classic isometric look.";
 
         label(pp, "Sheet plane:");
-        var PLANE_NAMES = ["Slope down-right", "Slope up-right", "Flat"];
-        var planeTiles = [], rp = tileRow(pp), i;
-        for (i = 0; i < 3; i++) {
-            var pb = rp.add("button", undefined, "");
-            pb.preferredSize = [TILE_W, TILE_H];
-            pb.axoIndex = i;
-            pb.helpTip = PLANE_NAMES[i];
-            pb.onDraw = function () {
-                try {
-                    var ax = planeAxes(this.axoIndex, num(tiltE.text, DEFAULTS.tilt));
-                    drawTile(this, [{ pts: sheetPts(ax, 0, 0), fill: C_SHEET, lines: letterLines(ax, 0, 0), lineW: 4 }],
-                             PLANE_NAMES[this.axoIndex], this.axoIndex === plane, TILE_FONT);
-                } catch (eD) {}
-            };
-            pb.onClick = function () {
-                plane = this.axoIndex;
-                repaint(planeTiles);
-                repaint(dirTiles);          // direction pictograms follow the plane
-            };
-            planeTiles.push(pb);
+        var PLANE_NAMES = ["Slope down-right", "Slope up-right", "Flat", "Floor"];
+        var PLANE_TIPS = ["Slope down-right: standing panels in an exploded view",
+                          "Slope up-right: standing panels in an exploded view",
+                          "Flat: no tilt, layers stay as they are and are lined up in a row",
+                          "Floor: sheets lying down, stacked like floors of a building"];
+        var PLANE_ORDER = [0, 1, 3, 2];                 // tiles left to right
+        var planeTiles = [], rp = tileRow(pp), i, PLANE_W = 128;
+        for (i = 0; i < 4; i++) {
+            planeTiles.push(addTile(rp, PLANE_ORDER[i], PLANE_W, PLANE_TIPS[PLANE_ORDER[i]],
+                function (b) {
+                    var tl = curTilt();
+                    if (plane === 2) tl = clamp(num(slopeTilt, DEFAULTS.tilt), 0, 80);   // slopes keep their tilt preview
+                    var ax = planeAxes(b.axoIndex, tl);
+                    drawTile(b, [{ pts: sheetPts(ax, 0, 0), fill: C_SHEET, lines: letterLines(ax, 0, 0), lineW: 4 }],
+                             PLANE_NAMES[b.axoIndex], b.axoIndex === plane, TILE_FONT);
+                },
+                function (idx) { plane = idx; applyPlaneRules(); }));
         }
 
-        // ---- Spreading the layers apart ----
-        var sp = panel("Spreading the layers apart");
+        // ---- Settings for the chosen layout (only one is shown at a time) ----
+        var stack = w.add("group");
+        stack.orientation = "stack";
+        stack.alignChildren = "fill";
+
+        // Exploded settings
+        var sp = panel(stack, "Exploded: spreading the layers apart");
         label(sp, "Direction:");
         var DIR_NAMES = ["Natural", "Natural reversed", "Custom"];
         var dirTiles = [], rd = tileRow(sp);
         for (i = 0; i < 3; i++) {
-            var db = rd.add("button", undefined, "");
-            db.preferredSize = [TILE_W, TILE_H];
-            db.axoIndex = i;
-            db.helpTip = DIR_NAMES[i] + " (orange = front layer)";
-            db.onDraw = function () {
-                try {
-                    var ax = planeAxes(plane, num(tiltE.text, DEFAULTS.tilt));
-                    var d = spreadDir(ax, this.axoIndex, num(customE.text, DEFAULTS.customAngle));
-                    var fills = [C_BACK, C_MID, C_FRONT], shapes = [], k;
-                    for (k = 0; k < 3; k++) {
-                        var sh = { pts: sheetPts(ax, k * 1.1 * d[0], k * 1.1 * d[1]), fill: fills[k] };
-                        if (k === 2) { sh.lines = letterLines(ax, k * 1.1 * d[0], k * 1.1 * d[1]); sh.lineW = 2; }
-                        shapes.push(sh);
-                    }
-                    drawTile(this, shapes, DIR_NAMES[this.axoIndex], this.axoIndex === mode, TILE_FONT);
-                } catch (eD2) {}
-            };
-            db.onClick = function () {
-                mode = this.axoIndex;
-                customE.enabled = (mode === 2);
-                repaint(dirTiles);
-            };
-            dirTiles.push(db);
+            dirTiles.push(addTile(rd, i, TILE_W, DIR_NAMES[i] + " (orange = front layer)",
+                function (b) {
+                    var ax = planeAxes(plane, curTilt());
+                    var d = spreadDir(ax, b.axoIndex, num(customE.text, DEFAULTS.customAngle));
+                    drawTile(b, explodedShapes(ax, d), DIR_NAMES[b.axoIndex], b.axoIndex === mode, TILE_FONT);
+                },
+                function (idx) { mode = idx; customE.enabled = (mode === 2); repaint(dirTiles); }));
         }
-        var legend = label(sp, "Orange sheet = front layer");
-
         var r4 = sp.add("group");
         label(r4, "Custom angle (X" + DEG + "):");
         var customE = numberField(r4, s.customAngle);
@@ -377,30 +457,105 @@
         var gapE = numberField(r5, s.gapPct);
         gapE.helpTip = "Percent of the artwork's larger side. 0 = stacked exactly.";
 
-        var revChk = sp.add("checkbox", undefined, "Reverse layer order");
+        // Row settings
+        var rwp = panel(stack, "Row: lining the layers up");
+        label(rwp, "Direction:");
+        var ROW_NAMES = ["Right", "Left", "Down", "Up", "Custom"];
+        var ROW_W = 100;
+        var rowTiles = [], rr = tileRow(rwp);
+        for (i = 0; i < 5; i++) {
+            rowTiles.push(addTile(rr, i, ROW_W, ROW_NAMES[i] + " (back layer first, orange = front layer)",
+                function (b) {
+                    var ax = planeAxes(plane, curTilt());
+                    var d = rowVector(b.axoIndex, num(rowAngleE.text, DEFAULTS.rowAngle));
+                    drawTile(b, rowShapes(ax, d, num(rowGapE.text, DEFAULTS.rowGapMm)),
+                             ROW_NAMES[b.axoIndex], b.axoIndex === rowDir, TILE_FONT);
+                },
+                function (idx) { rowDir = idx; rowAngleE.enabled = (rowDir === 4); repaint(rowTiles); }));
+        }
+        var r6 = rwp.add("group");
+        label(r6, "Custom angle (X" + DEG + "):");
+        var rowAngleE = numberField(r6, s.rowAngle);
+        rowAngleE.helpTip = "0 = right, 90 = up, 180 = left, 270 = down";
+        rowAngleE.enabled = (rowDir === 4);
+
+        var r7 = rwp.add("group");
+        label(r7, "Spacing (mm):");
+        var rowGapE = numberField(r7, s.rowGapMm);
+        rowGapE.helpTip = "5 = 5 mm gap, 0 = touching, -10 = 10 mm overlap.";
+
+        label(rwp, "Measure from:");
+        var MEASURE_NAMES = ["Whole artwork", "Each layer"];
+        var MEASURE_TIPS = ["Every layer gets a same-size slot (the whole selection's size) and keeps its spot inside it. Small pieces don't bunch up.",
+                            "Like the Align panel: each layer starts right where the previous one's edge ends."];
+        var measureTiles = [], rm = tileRow(rwp);
+        for (i = 0; i < 2; i++) {
+            var mt = addTile(rm, i, TILE_W, MEASURE_TIPS[i],
+                function (b) { drawTile(b, measureShapes(b.axoIndex), MEASURE_NAMES[b.axoIndex], b.axoIndex === rowMeasure, TILE_FONT); },
+                function (idx) { rowMeasure = idx; repaint(measureTiles); });
+            mt.preferredSize = [TILE_W, 88];
+            measureTiles.push(mt);
+        }
+
+        var og = w.add("group");
+        og.orientation = "row";
+        og.spacing = 24;
+        var revChk = og.add("checkbox", undefined, "Reverse layer order");
         revChk.helpTip = "Tick this if the layers come out upside-down";
         revChk.value = !!s.reverse;
         setFont(revChk, FONT);
+        var legend = label(og, "Orange sheet = front layer");
 
         // live pictogram updates while typing
-        tiltE.onChanging = function () { repaint(planeTiles); repaint(dirTiles); };
+        tiltE.onChanging = function () { repaintAll(); };
         customE.onChanging = function () { repaint(dirTiles); };
+        rowAngleE.onChanging = function () { repaint(rowTiles); };
+        rowGapE.onChanging = function () { repaint(rowTiles); };
 
         var bg = w.add("group");
         bg.alignment = "right";
         var cb = bg.add("button", undefined, "Cancel", { name: "cancel" });
         var ob = bg.add("button", undefined, "Explode!", { name: "ok" });
+        ob.preferredSize = [130, -1];
         setFont(cb, FONT);
         setFont(ob, FONT);
 
+        function applyPlaneRules() {
+            if (plane === 2) {
+                if (tiltE.enabled) slopeTilt = tiltE.text;      // remember the slope tilt
+                tiltE.text = "0";
+                tiltE.enabled = false;
+                layout = 1;
+            } else {
+                if (!tiltE.enabled) { tiltE.text = slopeTilt; tiltE.enabled = true; }
+                layout = 0;
+            }
+            showLayout();
+            repaintAll();
+        }
+        function showLayout() {
+            sp.visible = (layout === 0);
+            rwp.visible = (layout === 1);
+            if (layout === 1) ob.text = "Arrange!";
+            else ob.text = "Explode!";
+        }
+        applyPlaneRules();
+
         if (w.show() !== 1) return null;
 
+        var tiltOut = num(tiltE.text, DEFAULTS.tilt);
+        if (plane === 2) tiltOut = num(slopeTilt, DEFAULTS.tilt);   // keep the slope tilt for next time
         return {
-            tilt: clamp(num(tiltE.text, DEFAULTS.tilt), 5, 80),
+            tilt: clamp(tiltOut, 0, 80),
             plane: plane,
             spreadMode: mode,
             customAngle: num(customE.text, DEFAULTS.customAngle),
             gapPct: clamp(num(gapE.text, DEFAULTS.gapPct), 0, 1000),
+            layout: layoutFor(plane),
+            rowDir: rowDir,
+            rowAngle: num(rowAngleE.text, DEFAULTS.rowAngle),
+            rowGapMm: clamp(num(rowGapE.text, DEFAULTS.rowGapMm), -10000, 10000),
+            rowMeasure: rowMeasure,
             reverse: revChk.value
         };
     }
@@ -525,6 +680,8 @@
             var frontK = frontToBack[0];
 
             // ---- Projection maths ----
+            if (settings.plane === 2) settings.layout = 1;     // layout always follows the plane
+            else settings.layout = 0;
             var ax = planeAxes(settings.plane, settings.tilt);
             var uAxis = ax.u, vAxis = ax.v;
             var dir = spreadDir(ax, settings.spreadMode, settings.customAngle);
@@ -685,8 +842,10 @@
                     applyT(copy, goodM);
 
                     // move it to its place in the exploded stack
-                    var kx = cx - (LA * cx + LC * cy) + i * gap * dir[0] + sx;
-                    var ky = cy - (LB * cx + LD * cy) + i * gap * dir[1] + sy;
+                    var stepI = i;
+                    if (settings.layout === 1) stepI = 0;     // row layout: lined up afterwards
+                    var kx = cx - (LA * cx + LC * cy) + stepI * gap * dir[0] + sx;
+                    var ky = cy - (LB * cx + LD * cy) + stepI * gap * dir[1] + sy;
                     copy.translate(sgnX * (kx - shift[0]), sgnY * (ky - shift[1]));
 
                     // stroke widths back to exactly what they were
@@ -701,6 +860,76 @@
                 }
             }
 
+            // ---- Row layout: line the tilted copies up ----
+            // "Whole artwork": every layer gets a same-size slot (the whole selection's size
+            // along the direction) and keeps its spot inside it, so small pieces don't bunch up.
+            // "Each layer": like the Align panel's Distribute Spacing, each layer starts where
+            // the previous one ends. The spacing is added between them (negative = overlap).
+            // Positions across the direction stay as they were, so the structure keeps its shape.
+            if (settings.layout === 1) {
+                var rd = rowVector(settings.rowDir, settings.rowAngle);
+                var gapPt = settings.rowGapMm * PT_PER_MM;
+                var ext = [];
+                for (i = 0; i < n; i++) {
+                    ext.push(null);
+                    if (!copyByIdx[i]) continue;
+                    try {
+                        var bb = copyByIdx[i].geometricBounds;
+                        var cs4 = [[bb[0], bb[1]], [bb[2], bb[1]], [bb[2], bb[3]], [bb[0], bb[3]]];
+                        var lo = Infinity, hi = -Infinity;
+                        for (k = 0; k < 4; k++) {
+                            var dp = cs4[k][0] * rd[0] + cs4[k][1] * rd[1];
+                            if (dp < lo) lo = dp;
+                            if (dp > hi) hi = dp;
+                        }
+                        ext[i] = [lo, hi];
+                    } catch (eB) {}
+                }
+                var along = 0, prevEnd = null;
+                if (settings.rowMeasure === 0) {
+                    // whole artwork: one slot size for every layer, each keeps its spot in the slot
+                    var allLo = Infinity, allHi = -Infinity;
+                    for (i = 0; i < n; i++) {
+                        if (!ext[i]) continue;
+                        if (ext[i][0] < allLo) allLo = ext[i][0];
+                        if (ext[i][1] > allHi) allHi = ext[i][1];
+                    }
+                    var slot = (allHi - allLo) + gapPt;
+                    for (i = 0; i < n; i++) {
+                        if (!ext[i]) continue;
+                        along = i * slot;
+                        try { copyByIdx[i].translate(sgnX * along * rd[0], sgnY * along * rd[1]); } catch (eT0) {}
+                    }
+                } else {
+                    // each layer: Align-style, edge to edge
+                    for (i = 0; i < n; i++) {
+                        if (!ext[i]) continue;
+                        if (prevEnd !== null) along = prevEnd + gapPt - ext[i][0];
+                        else along = 0;
+                        prevEnd = ext[i][1] + along;
+                        try { copyByIdx[i].translate(sgnX * along * rd[0], sgnY * along * rd[1]); } catch (eT) {}
+                    }
+                }
+
+                // place the finished row to the right of the original, centred on it
+                var uL = Infinity, uT = -Infinity, uB = Infinity;
+                for (i = 0; i < n; i++) {
+                    if (!copyByIdx[i]) continue;
+                    try {
+                        var gb2 = copyByIdx[i].geometricBounds;
+                        if (gb2[0] < uL) uL = gb2[0];
+                        if (gb2[1] > uT) uT = gb2[1];
+                        if (gb2[3] < uB) uB = gb2[3];
+                    } catch (eU) {}
+                }
+                if (uL < Infinity) {
+                    var mx = (R + MARGIN_FACTOR * W) - uL, my = cy - (uT + uB) / 2;
+                    for (i = 0; i < n; i++) {
+                        if (copyByIdx[i]) { try { copyByIdx[i].translate(sgnX * mx, sgnY * my); } catch (eP) {} }
+                    }
+                }
+            }
+
             // ---- Copies get their normal Notes back ----
             for (i = 0; i < tmp.pageItems.length; i++) {
                 var ci2 = copyIndex(getNote(tmp.pageItems[i]));
@@ -710,6 +939,7 @@
             // ---- Wrap everything into one group (stacking order kept) ----
             var wrap = tmp.groupItems.add();          // becomes tmp item [0]
             wrap.name = "Exploded view";
+            if (settings.layout === 1) wrap.name = "Layer row";
             while (tmp.pageItems.length > 1) {
                 tmp.pageItems[1].move(tmp.pageItems[0], ElementPlacement.PLACEATEND);
             }
